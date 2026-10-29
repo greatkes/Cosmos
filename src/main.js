@@ -2,15 +2,14 @@ import * as THREE from 'three';
 import { CSS2DRenderer, CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRenderer.js';
 import { SKY_RADIUS, raDecToVec, skyMatrix, solarSystem } from './astro.js';
 import {
-  createMilkyWay, createStars, createConstellationLines, setConstellationHighlight,
+  createStars, createConstellationLines, setConstellationHighlight,
   createEcliptic, createSolarSystem, updateSolarSystem,
 } from './sky.js';
 import './style.css';
 
-const [starData, constellations, milkyWayTexture] = await Promise.all([
+const [starData, constellations] = await Promise.all([
   fetch('data/stars.json').then((r) => r.json()),
   fetch('data/constellations.json').then((r) => r.json()),
-  new THREE.TextureLoader().loadAsync('data/milkyway.jpg'),
 ]);
 
 // ── 장면 ─────────────────────────────────────────────
@@ -39,7 +38,6 @@ const sky = new THREE.Group();
 sky.matrixAutoUpdate = false;
 scene.add(sky);
 
-sky.add(createMilkyWay(milkyWayTexture));
 sky.add(createStars(starData.stars, renderer.getPixelRatio()));
 const constellationLines = createConstellationLines(constellations);
 sky.add(constellationLines);
@@ -47,12 +45,60 @@ sky.add(createEcliptic());
 const solar = createSolarSystem();
 sky.add(solar.group);
 
-// ── 땅과 지평선 ──────────────────────────────────────
-const ground = new THREE.Mesh(
+// ── 바다와 지평선 ────────────────────────────────────
+// 바다: 카메라를 둘러싼 공의 아래쪽 절반에, 수면 3m 위에서 내려다본 밤바다를 계산해 그린다
+const seaUniforms = { time: { value: 0 } };
+const sea = new THREE.Mesh(
   new THREE.SphereGeometry(SKY_RADIUS * 0.9, 64, 16, 0, Math.PI * 2, Math.PI / 2, Math.PI / 2),
-  new THREE.MeshBasicMaterial({ color: 0x07090b, side: THREE.BackSide }),
+  new THREE.ShaderMaterial({
+    uniforms: seaUniforms,
+    vertexShader: /* glsl */ `
+      varying vec3 vDir;
+      void main() {
+        vDir = position;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }`,
+    fragmentShader: /* glsl */ `
+      uniform float time;
+      varying vec3 vDir;
+
+      const float EYE_HEIGHT = 3.0;
+      const vec3 WATER = vec3(0.004, 0.010, 0.018);
+      const vec3 SKY_HORIZON = vec3(0.075, 0.100, 0.150);
+      const vec3 SKY_HIGH = vec3(0.008, 0.012, 0.040);
+
+      // 여러 방향의 물결을 겹친 수면 기울기
+      vec2 slope(vec2 p) {
+        vec2 g = vec2(0.0);
+        vec2 dirs[4] = vec2[](vec2(1.0, 0.2), vec2(-0.4, 1.0), vec2(0.7, -0.7), vec2(-0.9, -0.3));
+        float freqs[4] = float[](0.35, 0.62, 1.1, 1.9);
+        float amps[4] = float[](0.12, 0.07, 0.04, 0.02);
+        for (int i = 0; i < 4; i++) {
+          vec2 k = normalize(dirs[i]) * freqs[i];
+          g += amps[i] * k * cos(dot(k, p) + time * sqrt(9.8 * freqs[i]) * 0.6);
+        }
+        return g;
+      }
+
+      void main() {
+        vec3 d = normalize(vDir);
+        float down = max(-d.y, 1e-4);
+        // 눈에서 수면까지 닿는 지점
+        vec2 p = d.xz * (EYE_HEIGHT / down);
+        float dist = length(p);
+        // 먼 물결은 화면에서 깜빡이지 않게 잔잔하게 줄인다
+        vec2 g = slope(p) * exp(-dist / 60.0);
+        vec3 n = normalize(vec3(-g.x, 1.0, -g.y));
+        vec3 r = reflect(d, n);
+        // 비스듬히 볼수록 하늘이 더 많이 비친다 (프레넬)
+        float fresnel = 0.02 + 0.98 * pow(1.0 - max(dot(-d, n), 0.0), 5.0);
+        vec3 skyRefl = mix(SKY_HORIZON, SKY_HIGH, smoothstep(0.0, 0.35, r.y));
+        gl_FragColor = vec4(mix(WATER, skyRefl, fresnel), 1.0);
+      }`,
+    side: THREE.BackSide,
+  }),
 );
-scene.add(ground);
+scene.add(sea);
 
 // 지평선 바로 위의 옅은 빛띠
 const glowGeometry = new THREE.CylinderGeometry(SKY_RADIUS * 0.89, SKY_RADIUS * 0.89, 9, 64, 1, true);
@@ -89,7 +135,7 @@ for (const [text, x, z] of [['북', 0, -1], ['동', 1, 0], ['남', 0, 1], ['서'
   scene.add(label);
 }
 
-// ── 늘 보이는 이름: 북극성, 황도 12궁 ──────────────────
+// ── 늘 보이는 이름: 북극성, 황도 12궁, 태양과 행성 ──────
 const fixedLabels = [];
 for (const c of constellations.filter((c) => c.zodiac)) {
   const label = makeLabel(c.name, 'always zodiac');
@@ -102,6 +148,14 @@ for (const s of starData.named.filter((s) => s.always)) {
   label.position.copy(raDecToVec(s.ra, s.dec));
   label.center.set(-0.15, 0.5);
   sky.add(label);
+  fixedLabels.push(label);
+}
+// 태양과 행성은 날마다 자리를 옮기므로 이름을 천체에 붙여 함께 움직이게 한다
+const BODY_NAMES = { Sun: '태양', Mercury: '수성', Venus: '금성', Mars: '화성', Jupiter: '목성', Saturn: '토성' };
+for (const obj of [solar.sun, ...Object.values(solar.planets)]) {
+  const label = makeLabel(BODY_NAMES[obj.userData.id], obj === solar.sun ? 'always body sun' : 'always body');
+  label.center.set(obj === solar.sun ? 0.5 : -0.15, 0.5);
+  obj.add(label);
   fixedLabels.push(label);
 }
 
@@ -267,7 +321,8 @@ window.addEventListener('resize', () => {
   labelRenderer.setSize(window.innerWidth, window.innerHeight);
 });
 
-renderer.setAnimationLoop(() => {
+renderer.setAnimationLoop((ms) => {
+  seaUniforms.time.value = ms / 1000;
   camera.rotation.set(view.pitch, view.yaw, 0);
   fixedLabels.forEach(hideBelowHorizon);
   if (hoverLabel.visible) hideBelowHorizon(hoverLabel);

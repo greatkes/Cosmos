@@ -47,6 +47,18 @@ canvas:active {
   color: #f2f5fb;
 }
 
+.label.always.body {
+  margin-left: 4px;
+  font-size: 13px;
+  color: #ffe7b0;
+}
+
+/* 태양은 빛무리가 커서 이름을 아래에 단다 */
+.label.always.body.sun {
+  margin-left: 0;
+  margin-top: 46px;
+}
+
 .label.hover {
   padding: 3px 8px;
   border-radius: 6px;
